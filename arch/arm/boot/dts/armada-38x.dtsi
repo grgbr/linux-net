@@ -522,6 +522,11 @@
 				clocks = <&gateclk 4>;
 			};
 
+			ptp@7c000 {
+				compatible = "marvell,armada-370-neta-ptp";
+				reg = <0x7c000 0x1c>;
+			};
+
 			crypto@90000 {
 				compatible = "marvell,armada-38x-crypto";
 				reg = <0x90000 0x10000>;

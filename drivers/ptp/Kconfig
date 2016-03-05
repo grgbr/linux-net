@@ -53,6 +53,19 @@ config PTP_1588_CLOCK_IXP46X
 	  To compile this driver as a module, choose M here: the module
 	  will be called ptp_ixp46x.
 
+config PTP_1588_CLOCK_MVNETA
+	tristate "Marvell Armada 370/38x/XP network interface as PTP clock"
+	depends on MVNETA
+	select PTP_1588_CLOCK
+	help
+	  This driver adds support for using the network interface of Marvell
+	  ARMADA XP, ARMADA 370 and ARMADA 38x SoC family as a PTP clock.
+	  This clock is only useful if your PTP programs are getting hardware
+	  time stamps on the PTP Ethernet packets using the SO_TIMESTAMPING API.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called mvneta_ptp.
+
 comment "Enable PHYLIB and NETWORK_PHY_TIMESTAMPING to see the additional clocks."
 	depends on PHYLIB=n || NETWORK_PHY_TIMESTAMPING=n
 
