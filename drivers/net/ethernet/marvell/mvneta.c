@@ -371,6 +371,11 @@ struct mvneta_pcpu_port {
 	u32			cause_rx_tx;
 };
 
+struct mvneta_hwtstamp {
+	struct hwtstamp_config config;
+	struct mvneta_ptp *ptp;
+};
+
 struct mvneta_port {
 	u8 id;
 	struct mvneta_pcpu_port __percpu	*ports;
@@ -412,6 +417,8 @@ struct mvneta_port {
 	struct mvneta_bm_pool *pool_long;
 	struct mvneta_bm_pool *pool_short;
 	int bm_win_id;
+
+	struct mvneta_hwtstamp hwtstamp;
 
 	u64 ethtool_stats[ARRAY_SIZE(mvneta_statistics)];
 
@@ -1726,6 +1733,14 @@ static void mvneta_txq_bufs_free(struct mvneta_port *pp,
 			txq->txq_get_index;
 		struct sk_buff *skb = txq->tx_skb[txq->txq_get_index];
 
+		if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_IN_PROGRESS)) {
+			struct skb_shared_hwtstamps hwts;
+
+			mvneta_fill_hwtstamp(pp->hwtstamp, get_cqe_ts(cqe),
+					     &hwts);
+			skb_tstamp_tx(skb, &hwts);
+		}
+
 		mvneta_txq_inc_get(txq);
 
 		if (!IS_TSO_HEADER(txq, tx_desc->buf_phys_addr))
@@ -2355,6 +2370,12 @@ out:
 	if (frags > 0) {
 		struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
 		struct netdev_queue *nq = netdev_get_tx_queue(dev, txq_id);
+
+		if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) &&
+		    pp->hwtstamp.config.tx_type == HWTSTAMP_TX_ON)
+			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+		else
+			skb_tx_timestamp(skb);
 
 		txq->count += frags;
 		mvneta_txq_pend_desc_add(pp, txq, frags);
@@ -3491,12 +3512,81 @@ static int mvneta_stop(struct net_device *dev)
 	return 0;
 }
 
+/*
+ * Currently HWTSTAMP_FILTER_ALL/NONE and HWTSAMP_TX_ON/OFF only are supported.
+ * TODO: complete me
+ */
+static int mvneta_setup_ptp_filters(struct mvneta_port *pp,
+				    struct hwtstamp_config *config)
+{
+	switch (config->tx_type) {
+	case HWTSTAMP_TX_OFF:
+	case HWTSTAMP_TX_ON:
+		break;
+	default:
+		return -ERANGE;
+	}
+
+	switch (config->rx_filter) {
+	case HWTSTAMP_FILTER_NONE:
+		break;
+	case HWTSTAMP_FILTER_ALL:
+	case HWTSTAMP_FILTER_SOME:
+	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT: /*PTP v1, UDP, any kind of event packet*/
+	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:  /*PTP v1, UDP, Sync packet*/
+	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ: /*PTP v1, UDP, Delay_req packet*/
+	case HWTSTAMP_FILTER_PTP_V2_L4_EVENT:/*PTP v2, UDP, any kind of event packet*/
+	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:/*PTP v2, UDP, Sync packet*/
+	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:/*PTP v2, UDP, Delay_req packet*/
+	case HWTSTAMP_FILTER_PTP_V2_L2_EVENT:/*802.AS1, Ethernet, any kind of event packet*/
+	case HWTSTAMP_FILTER_PTP_V2_L2_SYNC:/*802.AS1, Ethernet, Sync packet*/
+	case HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ:/*802.AS1, Ethernet, Delay_req packet*/
+	case HWTSTAMP_FILTER_PTP_V2_EVENT:/*PTP v2/802.AS1, any layer, any kind of event packet*/
+	case HWTSTAMP_FILTER_PTP_V2_SYNC:/*PTP v2/802.AS1, any layer, Sync packet*/
+	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:/*PTP v2/802.AS1, any layer, Delay_req packet*/
+		config->rx_filter = HWTSTAMP_FILTER_ALL;
+		break;
+	default:
+		return -ERANGE;
+	}
+
+	memcpy(&pp->hwtstamp.config, config, sizeof(*config));
+
+	return 0;
+}
+
 static int mvneta_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
 	struct mvneta_port *pp = netdev_priv(dev);
 
 	if (!pp->phy_dev)
 		return -ENOTSUPP;
+
+	if (cmd == SIOCSHWTSTAMP) {
+		struct hwtstamp_config conf;
+		int                    err;
+
+		if (copy_from_user(&conf, ifr->ifr_data, sizeof(conf)))
+			return -EFAULT;
+
+		/* no flags defined right now, must be zero */
+		if (conf.flags)
+			return -EINVAL;
+
+		err = mvneta_setup_ptp_filters(pp, &conf);
+		if (err < 0)
+			return err;
+
+		if (copy_to_user(ifr->ifr_data, &conf, sizeof(conf)))
+			return -EFAULT;
+		return 0;
+	}
+	else if (cmd == SIOCGHWTSTAMP) {
+		if (copy_to_user(ifr->ifr_data, &pp->hwtstamp_config,
+		                 sizeof(&pp->hwtstamp_config)))
+			return -EFAULT;
+		return 0;
+	}
 
 	return phy_mii_ioctl(pp->phy_dev, ifr, cmd);
 }
@@ -3805,6 +3895,36 @@ static int mvneta_ethtool_get_rxfh(struct net_device *dev, u32 *indir, u8 *key,
 	return 0;
 }
 
+/*
+ * Currently HWTSTAMP_FILTER_ALL/NONE and HWTSAMP_TX_ON/OFF only are supported.
+ * TODO: complete me
+ */
+static int mvneta_ethtool_get_ts_info(struct net_device *dev,
+				      struct ethtool_ts_info *info)
+{
+	struct mvneta_port *pp = netdev_priv(dev);
+	int ret;
+
+	ret = ethtool_op_get_ts_info(dev, info);
+	if (ret)
+		return ret;
+
+	info->phc_index = pp->hwtstamp.ptp ?
+			  ptp_clock_index(pp->hwtstamp.ptp->clock) : -1;
+
+	info->so_timestamping |= SOF_TIMESTAMPING_TX_HARDWARE |
+				 SOF_TIMESTAMPING_RX_HARDWARE |
+				 SOF_TIMESTAMPING_RAW_HARDWARE;
+
+	info->tx_types = (BIT(1) << HWTSTAMP_TX_OFF) |
+			 (BIT(1) << HWTSTAMP_TX_ON);
+
+	info->rx_filters = (BIT(1) << HWTSTAMP_FILTER_NONE) |
+			   (BIT(1) << HWTSTAMP_FILTER_ALL);
+
+	return 0;
+}
+
 static const struct net_device_ops mvneta_netdev_ops = {
 	.ndo_open            = mvneta_open,
 	.ndo_stop            = mvneta_stop,
@@ -3833,6 +3953,7 @@ const struct ethtool_ops mvneta_eth_tool_ops = {
 	.get_rxnfc	= mvneta_ethtool_get_rxnfc,
 	.get_rxfh	= mvneta_ethtool_get_rxfh,
 	.set_rxfh	= mvneta_ethtool_set_rxfh,
+	.get_ts_info    = mvneta_ethtool_get_ts_info,
 };
 
 /* Initialize hw */

@@ -1,15 +1,4 @@
 /*
- * Driver for Marvell NETA network card for Armada XP and Armada 370 SoCs.
- *
- * Copyright (C) 2012 Marvell
- *
- * Rami Rosen <rosenr@marvell.com>
- * Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2. This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- *
  * TODO:
  *   - implement external pin support
  */
@@ -37,6 +26,18 @@
 #define         MVNETA_PTP_RESET_EN       BIT(1)
 #define MVNETA_PTP_CLOCK_REG (0x18U)
 #define         MVNETA_PTP_CLOCK_EXT      BIT(1)
+
+/*
+ * PTP port registers.
+ */
+#define MVNETA_PTP_PORT_CFG0_REG                 (0x0U)
+#define         MVNETA_PTP_PORT_CFG0_DIS         BIT(1)
+#define         MVNETA_PTP_PORT_CFG0_TSPEC_SHIFT (12)
+
+/*
+ * PTP global registers.
+ */
+#define MVNETA_PTP_GLOB_CFG0_REG                 (0x0U)
 
 /*
  * Time Application Interface registers.
@@ -71,6 +72,74 @@ struct mvneta_ptp {
 	struct delayed_work    unwrap;
 	struct device         *dev;
 };
+
+void mvneta_fill_hwtstamp(struct mvneta_ptp           *ptp,
+			  u64                          timestamp,
+			  struct skb_shared_hwtstamps *hwtstamps)
+{
+	u64 nsec;
+
+	read_lock(&ptp->lock);
+	nsec = timecounter_cyc2time(&ptp->time, timestamp);
+	read_unlock(&ptp->lock);
+
+	hwts->hwtstamp = ns_to_ktime(nsec);
+}
+EXPORT_SYMBOL(mvneta_fill_hwtstamp);
+
+static int mvneta_setup_ptp(const struct mvneta_ptp *ptp,
+			    __be16                   ethtype,
+			    u16                      msgids,
+			    u16                      arrptr)
+{
+	/* Setup ethertype matching. */
+	int err = mvneta_write_glob(ptp, port, MVNETA_PTP_GLOB_CFG0_REG,
+				    ethtype)
+	if (err)
+		return err;
+
+	/* Setup PTP message ids matching mask. */
+	err = mvneta_write_glob(ptp, port, MVNETA_PTP_GLOB_CFG1_REG, msgids)
+	if (err)
+		return err;
+
+	/* Setup PTP arrival timestamping counter mask. */
+	return mvneta_write_glob(ptp, port, MVNETA_PTP_GLOB_CFG2_REG, arrptr)
+}
+
+int mvneta_setup_port_ptp(const struct mvneta_ptp *ptp,
+			  u8                       port,
+			  u8                       tspec)
+{
+	/* Disable port PTP logic first. */
+	int err = mvneta_write_ptp(ptp, port, MVNETA_PTP_PORT_CFG0_REG,
+				   MVNETA_PTP_PORT_CFG0_DIS);
+
+	if (err)
+		return err;
+
+	if (tspec > 0xf)
+		/* Transport Specific field is 4 bits wide. */
+		return -EINVAL;
+
+	/*
+	 * Enable generation of interrupt upon hardware timestamping of outgoing
+	 * and incoming frames.
+	 */
+	err = mvneta_write_ptp(ptp, port, MVNETA_PTP_PORT_CFG2_REG,
+			        MVNETA_PTP_GLOB_CFG2_DEPIRQ |
+			        MVNETA_PTP_GLOB_CFG2_ARRIRQ);
+	if (err)
+		return err;
+
+	/*
+	 * Now that everything is ready, setup transport specific field then
+	 * enable port PTP logic.
+	 */
+	return mvneta_write_ptp(ptp, port, MVNETA_PTP_PORT_CFG0_REG,
+			        tspec << MVNETA_PTP_PORT_CFG0_TSPEC_SHIFT);
+}
+EXPORT_SYMBOL(mvneta_setup_txtstamp);
 
 static int mvneta_wait_ptp(const struct mvneta_ptp *ptp)
 {
@@ -107,6 +176,7 @@ static int mvneta_read_ptp(const struct mvneta_ptp *ptp,
 
 	if (mvneta_wait_ptp(ptp))
 		return -EBUSY;
+
 	*data = readw(ptp->regs + MVNETA_PTP_DATA_REG);
 	return 0;
 }
